@@ -1,1209 +1,829 @@
-/**
- * =============================================================================
- *  AMIR VIRUS — Cloudflare Worker
- * =============================================================================
- *  A self-hosted VLESS-over-WebSocket proxy with a hardened admin panel,
- *  built to run entirely on Cloudflare's free Workers plan + one KV namespace.
- *
- *  WHAT'S INSIDE:
- *   - Admin panel (Persian/RTL, dark "virus" theme) served at GET /admin
- *   - Hashed admin password (SHA-256 + salt) + expiring session tokens
- *   - Login rate-limiting (defeats brute-force password guessing)
- *   - Multi-user management: total quota, DAILY quota (auto-resets), expiry,
- *     enable/disable, and an auto-disabled flag so the panel is honest about
- *     *why* a user stopped working
- *   - Global kill switch: one toggle takes the whole tunnel offline instantly
- *   - Subscription link generation (VLESS URI / base64, Clash-Meta YAML, and
- *     an inline QR code so mobile users can scan instead of copy-pasting)
- *   - "Virus Radar" deep scanner: scans a much larger, concurrency-limited
- *     pool of Cloudflare IPs than a naive implementation, caches results with
- *     a timestamp in KV so the panel doesn't need to rescan on every page
- *     load, and lets the admin apply any result as the new HOST in one tap
- *   - Built-in activity log viewer in the panel (no more guessing what
- *     happened — every login, user change, and radar action is recorded)
- *   - VLESS protocol parser + WebSocket <-> TCP bridge using the Workers
- *     `connect()` (cloudflare:sockets) API
- *
- *  HONEST SCOPE NOTE: this worker intentionally supports ONE protocol
- *  (VLESS over WebSocket+TLS) rather than several. That's a deliberate
- *  trade-off for a smaller, more auditable codebase — see README.md for a
- *  feature-by-feature comparison against other public projects in this
- *  space.
- *
- *  ANTI-CENSORSHIP NOTES:
- *   - SNI spoofing / TLS fragmentation / ECH are all *client-side* behaviors.
- *     This worker stores and exposes the relevant fields in the subscription
- *     link; the actual evasion happens in the connecting app (v2rayNG,
- *     NekoBox, sing-box, Clash-Meta, etc.), not on the worker itself.
- *   - "Clean IP" selection (Virus Radar) works by probing a wide, randomized
- *     sample of Cloudflare's own edge IP ranges from the same network the
- *     admin is deploying from, and keeping only the ones that answered
- *     fastest. There is no special/private IP pool — it's the same public
- *     Cloudflare edge everyone uses, just measured from your own vantage
- *     point so you get the entry point that suits your ISP.
- *
- *  STORAGE (Cloudflare KV, binding name: VIRUS_PROXY_KV):
- *   - "settings"       -> JSON { host, path, sni, fragment, ech, killSwitch }
- *   - "users"          -> JSON array of user objects
- *   - "adminPassHash"  -> JSON { salt, hash } (SHA-256(salt + password))
- *   - "adminSession"   -> JSON { token, expiresAt }
- *   - "loginAttempts"  -> JSON { count, windowStart }
- *   - "logs"           -> JSON array of recent activity log lines (capped)
- *   - "radarCache"     -> JSON { scannedAt, results: [{ip, latency}] }
- * =============================================================================
- */
+// ================================================================
+//  Amir Nova Proxy  —  Cloudflare Worker
+//  پروکسی VLESS-over-WebSocket با پنل مدیریت، اسکنر IP، Health-Check
+//  و به‌روزرسانی خودکار HOST
+//
+//  نکته مهم (بخوانید!):
+//  این کد ساختار پروتکل VLESS و WebSocket proxy را از الگوی متداول
+//  و عمومیِ پروژه‌های "vless-worker" می‌گیرد (همان چیزی که در
+//  Amir Virus هم وجود دارد) و بخش‌های مدیریتی/اسکن/آپدیت خودکار را
+//  به آن اضافه می‌کند. قبل از استفاده‌ی واقعی حتماً تست کنید.
+// ================================================================
 
 import { connect } from 'cloudflare:sockets';
 
-// -----------------------------------------------------------------------------
-// Constants
-// -----------------------------------------------------------------------------
-
-const BRAND = 'Amir Virus';
-
-const KV_KEYS = {
-  SETTINGS: 'settings',
-  USERS: 'users',
-  ADMIN_PASS_HASH: 'adminPassHash',
-  ADMIN_SESSION: 'adminSession',
-  LOGIN_ATTEMPTS: 'loginAttempts',
-  LOGS: 'logs',
-  RADAR_CACHE: 'radarCache',
-};
-
-const DEFAULT_SETTINGS = {
-  host: 'example.workers.dev',
-  path: '/ws',
-  sni: 'www.google.com',
-  fragment: '1,40-60,30-50',
-  ech: false,
-  killSwitch: false, // when true, /ws refuses every connection instantly
-};
-
-const DEFAULT_ADMIN_PASS = 'change-this-password';
-const MAX_LOG_ENTRIES = 300;
-const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24h
-const LOGIN_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
-const LOGIN_MAX_ATTEMPTS = 5;
+// ---------------------------------------------------------------
+// ثابت‌ها و مقادیر پیش‌فرض
+// ---------------------------------------------------------------
 const WS_READY_STATE_OPEN = 1;
+const WS_READY_STATE_CLOSING = 2;
 
-// -----------------------------------------------------------------------------
-// Small utilities
-// -----------------------------------------------------------------------------
+// اگر در KV هنوز تنظیمات اولیه ست نشده باشد از این مقادیر استفاده می‌شود
+const DEFAULT_CONFIG = {
+	host: '',              // HOST فعلی که به‌صورت خودکار آپدیت می‌شود
+	path: '/vless-ws',      // مسیر وب‌سوکت
+	sni: '',                // در صورت خالی بودن از host استفاده می‌شود
+	fragment: 'tlshello,1,fake', // پارامتر fragment برای کلاینت‌هایی که ساپورت می‌کنند
+	ech: '',                // ECH config (اختیاری - خالی یعنی غیرفعال)
+	killSwitch: false,      // اگر true باشد همه اتصالات رد می‌شوند
+	candidateIPs: [
+		// این‌ها فقط نمونه‌اند؛ حتماً از پنل، لیست IP تمیز/به‌روز خودتان را وارد کنید
+		'104.16.0.0', '104.17.0.0', '104.18.0.0', '104.19.0.0', '104.20.0.0'
+	],
+	lastScanAt: 0,
+	lastScanResults: [] // [{ip, latencyMs}]
+};
 
-function uuid() {
-  return crypto.randomUUID();
+// ---------------------------------------------------------------
+// توابع کمکی عمومی
+// ---------------------------------------------------------------
+
+function uuidv4() {
+	return crypto.randomUUID();
 }
 
-function jsonResponse(data, status = 200, extraHeaders = {}) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: {
-      'Content-Type': 'application/json; charset=utf-8',
-      'Access-Control-Allow-Origin': '*',
-      ...extraHeaders,
-    },
-  });
+function nowISO() {
+	return new Date().toISOString();
 }
 
-function textResponse(text, status = 200, contentType = 'text/plain; charset=utf-8') {
-  return new Response(text, { status, headers: { 'Content-Type': contentType } });
+async function getConfig(env) {
+	const raw = await env.NOVA_KV.get('config');
+	if (!raw) {
+		await env.NOVA_KV.put('config', JSON.stringify(DEFAULT_CONFIG));
+		return { ...DEFAULT_CONFIG };
+	}
+	return { ...DEFAULT_CONFIG, ...JSON.parse(raw) };
 }
 
-function htmlResponse(html, status = 200) {
-  return new Response(html, {
-    status,
-    headers: {
-      'Content-Type': 'text/html; charset=utf-8',
-      'X-Content-Type-Options': 'nosniff',
-      'X-Frame-Options': 'DENY',
-      'Referrer-Policy': 'no-referrer',
-    },
-  });
+async function saveConfig(env, cfg) {
+	await env.NOVA_KV.put('config', JSON.stringify(cfg));
 }
 
-function base64Encode(str) {
-  const bytes = new TextEncoder().encode(str);
-  let binary = '';
-  bytes.forEach((b) => (binary += String.fromCharCode(b)));
-  return btoa(binary);
+async function addLog(env, type, message) {
+	const key = 'log:' + Date.now() + ':' + Math.random().toString(36).slice(2, 7);
+	const entry = { type, message, time: nowISO() };
+	await env.NOVA_KV.put(key, JSON.stringify(entry), { expirationTtl: 60 * 60 * 24 * 14 }); // ۱۴ روز نگهداری
 }
 
-function safeEqual(a, b) {
-  if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;
-  let result = 0;
-  for (let i = 0; i < a.length; i++) result |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return result === 0;
+async function getLogs(env, limit = 100) {
+	const list = await env.NOVA_KV.list({ prefix: 'log:', limit: 1000 });
+	const keys = list.keys.map(k => k.name).sort().reverse().slice(0, limit);
+	const entries = await Promise.all(keys.map(k => env.NOVA_KV.get(k)));
+	return entries.filter(Boolean).map(e => JSON.parse(e));
 }
+
+// کاربران در KV با پیشوند user: ذخیره می‌شوند
+async function getUser(env, token) {
+	const raw = await env.NOVA_KV.get('user:' + token);
+	return raw ? JSON.parse(raw) : null;
+}
+
+async function saveUser(env, user) {
+	await env.NOVA_KV.put('user:' + user.token, JSON.stringify(user));
+}
+
+async function listUsers(env) {
+	const list = await env.NOVA_KV.list({ prefix: 'user:' });
+	const users = await Promise.all(list.keys.map(k => env.NOVA_KV.get(k.name)));
+	return users.filter(Boolean).map(u => JSON.parse(u));
+}
+
+async function deleteUser(env, token) {
+	await env.NOVA_KV.delete('user:' + token);
+}
+
+// بررسی معتبر بودن کاربر: فعال بودن، منقضی نشدن، رد نشدن از سقف ترافیک
+function isUserValid(user) {
+	if (!user || !user.active) return false;
+	if (user.expiresAt && Date.now() > user.expiresAt) return false;
+	if (user.trafficLimitTotal > 0 && user.trafficUsedTotal >= user.trafficLimitTotal) return false;
+	if (user.trafficLimitDaily > 0) {
+		const today = new Date().toISOString().slice(0, 10);
+		if (user.dailyDate === today && user.trafficUsedDaily >= user.trafficLimitDaily) return false;
+	}
+	return true;
+}
+
+function trackUsage(user, bytes) {
+	const today = new Date().toISOString().slice(0, 10);
+	if (user.dailyDate !== today) {
+		user.dailyDate = today;
+		user.trafficUsedDaily = 0;
+	}
+	user.trafficUsedTotal = (user.trafficUsedTotal || 0) + bytes;
+	user.trafficUsedDaily = (user.trafficUsedDaily || 0) + bytes;
+}
+
+// ---------------------------------------------------------------
+// احراز هویت پنل ادمین (کوکی ساده امضاشده)
+// ---------------------------------------------------------------
 
 async function sha256Hex(text) {
-  const data = new TextEncoder().encode(text);
-  const digest = await crypto.subtle.digest('SHA-256', data);
-  return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, '0')).join('');
+	const data = new TextEncoder().encode(text);
+	const hash = await crypto.subtle.digest('SHA-256', data);
+	return [...new Uint8Array(hash)].map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-function randomSalt() {
-  return uuid().replace(/-/g, '');
+async function makeSessionToken(env) {
+	const raw = env.ADMIN_PASS + ':' + Math.floor(Date.now() / (1000 * 60 * 60 * 12)); // هر ۱۲ ساعت عوض می‌شود
+	return sha256Hex(raw);
 }
 
-// -----------------------------------------------------------------------------
-// KV data access layer
-// -----------------------------------------------------------------------------
-
-async function getSettings(env) {
-  const raw = await env.VIRUS_PROXY_KV.get(KV_KEYS.SETTINGS);
-  if (!raw) {
-    await env.VIRUS_PROXY_KV.put(KV_KEYS.SETTINGS, JSON.stringify(DEFAULT_SETTINGS));
-    return { ...DEFAULT_SETTINGS };
-  }
-  try {
-    return { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
-  } catch {
-    return { ...DEFAULT_SETTINGS };
-  }
+async function isAuthed(request, env) {
+	const cookie = request.headers.get('Cookie') || '';
+	const match = cookie.match(/nova_session=([a-f0-9]+)/);
+	if (!match) return false;
+	const expected = await makeSessionToken(env);
+	return match[1] === expected;
 }
 
-async function saveSettings(env, settings) {
-  const clean = {
-    host: String(settings.host || DEFAULT_SETTINGS.host).trim(),
-    path: String(settings.path || DEFAULT_SETTINGS.path).trim(),
-    sni: String(settings.sni || DEFAULT_SETTINGS.sni).trim(),
-    fragment: String(settings.fragment || DEFAULT_SETTINGS.fragment).trim(),
-    ech: Boolean(settings.ech),
-    killSwitch: Boolean(settings.killSwitch),
-  };
-  await env.VIRUS_PROXY_KV.put(KV_KEYS.SETTINGS, JSON.stringify(clean));
-  return clean;
+// ---------------------------------------------------------------
+// منطق VLESS (پارس هدر + تونل TCP)
+// این بخش همان ساختار استاندارد vless-over-websocket است.
+// ---------------------------------------------------------------
+
+function base64ToUint8(base64Str) {
+	base64Str = base64Str.replace(/-/g, '+').replace(/_/g, '/');
+	const decoded = atob(base64Str);
+	const arr = new Uint8Array(decoded.length);
+	for (let i = 0; i < decoded.length; i++) arr[i] = decoded.charCodeAt(i);
+	return arr;
 }
 
-async function getUsers(env) {
-  const raw = await env.VIRUS_PROXY_KV.get(KV_KEYS.USERS);
-  if (!raw) return [];
-  try {
-    return JSON.parse(raw);
-  } catch {
-    return [];
-  }
+// پارس کردن هدر VLESS طبق مستندات پروتکل
+function parseVlessHeader(buffer, validUUID) {
+	const view = new DataView(buffer);
+	const version = view.getUint8(0);
+	const idBytes = new Uint8Array(buffer.slice(1, 17));
+	const idStr = [...idBytes].map(b => b.toString(16).padStart(2, '0')).join('');
+	const formattedId = `${idStr.slice(0,8)}-${idStr.slice(8,12)}-${idStr.slice(12,16)}-${idStr.slice(16,20)}-${idStr.slice(20)}`;
+	if (formattedId !== validUUID) {
+		return { hasError: true, message: 'UUID نامعتبر است' };
+	}
+	const optLength = view.getUint8(17);
+	const cmdOffset = 18 + optLength;
+	const command = view.getUint8(cmdOffset); // 1 = TCP, 2 = UDP
+	const portOffset = cmdOffset + 1;
+	const port = view.getUint16(portOffset);
+	const addrTypeOffset = portOffset + 2;
+	const addrType = view.getUint8(addrTypeOffset);
+	let addrLength = 0, addrValueOffset = addrTypeOffset + 1, address = '';
+
+	if (addrType === 1) { // IPv4
+		addrLength = 4;
+		address = new Uint8Array(buffer.slice(addrValueOffset, addrValueOffset + addrLength)).join('.');
+	} else if (addrType === 2) { // Domain
+		addrLength = view.getUint8(addrValueOffset);
+		addrValueOffset += 1;
+		address = new TextDecoder().decode(buffer.slice(addrValueOffset, addrValueOffset + addrLength));
+	} else if (addrType === 3) { // IPv6
+		addrLength = 16;
+		const dv = new DataView(buffer.slice(addrValueOffset, addrValueOffset + addrLength));
+		const parts = [];
+		for (let i = 0; i < 8; i++) parts.push(dv.getUint16(i * 2).toString(16));
+		address = parts.join(':');
+	} else {
+		return { hasError: true, message: 'نوع آدرس نامعتبر است' };
+	}
+
+	return {
+		hasError: false,
+		addressType: addrType,
+		addressRemote: address,
+		portRemote: port,
+		rawDataIndex: addrValueOffset + addrLength,
+		vlessVersion: new Uint8Array([version]),
+		isUDP: command === 2,
+	};
 }
 
-async function saveUsers(env, users) {
-  await env.VIRUS_PROXY_KV.put(KV_KEYS.USERS, JSON.stringify(users));
+// تبدیل ReadableStream وب‌سوکت به یک stream قابل استفاده
+function makeReadableWebSocketStream(webSocket, earlyDataHeader) {
+	let readableStreamCancel = false;
+	return new ReadableStream({
+		start(controller) {
+			webSocket.addEventListener('message', (event) => {
+				if (readableStreamCancel) return;
+				controller.enqueue(event.data);
+			});
+			webSocket.addEventListener('close', () => {
+				if (!readableStreamCancel) controller.close();
+			});
+			webSocket.addEventListener('error', (err) => {
+				controller.error(err);
+			});
+			// داده‌های early-data (0-RTT) که ممکن است در هدر base64 آمده باشند
+			try {
+				if (earlyDataHeader) {
+					const earlyData = base64ToUint8(earlyDataHeader);
+					controller.enqueue(earlyData.buffer);
+				}
+			} catch (e) { /* بی‌اهمیت اگر early data نبود */ }
+		},
+		cancel() {
+			readableStreamCancel = true;
+			safeCloseWebSocket(webSocket);
+		}
+	});
 }
 
-async function getAdminPassHash(env) {
-  const raw = await env.VIRUS_PROXY_KV.get(KV_KEYS.ADMIN_PASS_HASH);
-  if (raw) {
-    try {
-      return JSON.parse(raw);
-    } catch {
-      /* fall through to reseed */
-    }
-  }
-  const initialPass = (env.ADMIN_PASS && String(env.ADMIN_PASS)) || DEFAULT_ADMIN_PASS;
-  const salt = randomSalt();
-  const hash = await sha256Hex(salt + initialPass);
-  const record = { salt, hash };
-  await env.VIRUS_PROXY_KV.put(KV_KEYS.ADMIN_PASS_HASH, JSON.stringify(record));
-  return record;
+function safeCloseWebSocket(socket) {
+	try {
+		if (socket.readyState === WS_READY_STATE_OPEN || socket.readyState === WS_READY_STATE_CLOSING) {
+			socket.close();
+		}
+	} catch (e) { /* نادیده گرفتن خطای بستن */ }
 }
 
-async function setAdminPass(env, newPass) {
-  const salt = randomSalt();
-  const hash = await sha256Hex(salt + newPass);
-  await env.VIRUS_PROXY_KV.put(KV_KEYS.ADMIN_PASS_HASH, JSON.stringify({ salt, hash }));
+// هسته اصلی هندل کردن یک اتصال VLESS روی WebSocket
+async function handleVlessWebSocket(request, env, user) {
+	const [client, webSocket] = Object.values(new WebSocketPair());
+	webSocket.accept();
+
+	const earlyDataHeader = request.headers.get('sec-websocket-protocol') || '';
+	const readableStream = makeReadableWebSocketStream(webSocket, earlyDataHeader);
+
+	let remoteSocket = null;
+	let udpWrite = null;
+	let isDNS = false;
+	let totalBytes = 0;
+
+	readableStream.pipeTo(new WritableStream({
+		async write(chunk) {
+			if (remoteSocket) {
+				const writer = remoteSocket.writable.getWriter();
+				await writer.write(chunk);
+				writer.releaseLock();
+				totalBytes += chunk.byteLength;
+				return;
+			}
+
+			const vlessHeader = parseVlessHeader(chunk, user.uuid);
+			if (vlessHeader.hasError) {
+				safeCloseWebSocket(webSocket);
+				return;
+			}
+
+			const rawClientData = chunk.slice(vlessHeader.rawDataIndex);
+			const vlessRespHeader = new Uint8Array([vlessHeader.vlessVersion[0], 0]);
+
+			if (vlessHeader.isUDP) {
+				// در این نسخه ساده، UDP فقط برای DNS پشتیبانی می‌شود (مانند اکثر پیاده‌سازی‌های vless-worker)
+				if (vlessHeader.portRemote !== 53) {
+					safeCloseWebSocket(webSocket);
+					return;
+				}
+				isDNS = true;
+			}
+
+			if (isDNS) {
+				// درخواست DNS را به سرویس DoH کلودفلر forward می‌کنیم
+				const dnsResp = await fetch('https://1.1.1.1/dns-query', {
+					method: 'POST',
+					headers: { 'content-type': 'application/dns-message' },
+					body: rawClientData,
+				});
+				const dnsRespBuf = await dnsResp.arrayBuffer();
+				const sizeBuf = new Uint8Array([(dnsRespBuf.byteLength >> 8) & 0xff, dnsRespBuf.byteLength & 0xff]);
+				if (webSocket.readyState === WS_READY_STATE_OPEN) {
+					webSocket.send(await new Blob([vlessRespHeader, sizeBuf, dnsRespBuf]).arrayBuffer());
+				}
+				return;
+			}
+
+			// اتصال TCP واقعی به مقصد از طریق Cloudflare TCP Sockets API
+			remoteSocket = connect({ hostname: vlessHeader.addressRemote, port: vlessHeader.portRemote });
+			const writer = remoteSocket.writable.getWriter();
+			await writer.write(rawClientData);
+			writer.releaseLock();
+			totalBytes += rawClientData.byteLength;
+
+			// انتقال داده از سرور مقصد به کلاینت
+			let headerSent = false;
+			remoteSocket.readable.pipeTo(new WritableStream({
+				write(chunk) {
+					if (webSocket.readyState !== WS_READY_STATE_OPEN) return;
+					if (!headerSent) {
+						webSocket.send(new Blob([vlessRespHeader, chunk]).arrayBuffer ? chunk : chunk); // ارسال داده
+						headerSent = true;
+						webSocket.send(chunk);
+					} else {
+						webSocket.send(chunk);
+					}
+					totalBytes += chunk.byteLength;
+				},
+				close() { safeCloseWebSocket(webSocket); },
+				abort() { safeCloseWebSocket(webSocket); },
+			})).catch(() => safeCloseWebSocket(webSocket));
+		},
+		close() {
+			// اتصال بسته شد -> ترافیک مصرفی کاربر را ثبت می‌کنیم
+			trackUsage(user, totalBytes);
+			saveUser(env, user).catch(() => {});
+		},
+	})).catch(() => {
+		safeCloseWebSocket(webSocket);
+	});
+
+	return new Response(null, { status: 101, webSocket: client });
 }
 
-async function verifyAdminPass(env, candidate) {
-  const { salt, hash } = await getAdminPassHash(env);
-  const candidateHash = await sha256Hex(salt + candidate);
-  return safeEqual(candidateHash, hash);
+// ---------------------------------------------------------------
+// تولید لینک‌های اشتراک (VLESS base64 و Clash YAML)
+// ---------------------------------------------------------------
+
+function buildVlessLink(cfg, user, remark) {
+	const host = cfg.host;
+	const sni = cfg.sni || host;
+	const params = new URLSearchParams({
+		type: 'ws',
+		security: 'tls',
+		sni,
+		path: cfg.path,
+		host,
+	});
+	if (cfg.fragment) params.set('fragment', cfg.fragment);
+	if (cfg.ech) params.set('ech', cfg.ech);
+	// پورت 443 چون فقط با TLS روی این پورت هندشیک واقعی و پینگ مثبت خواهیم داشت
+	return `vless://${user.uuid}@${host}:443?${params.toString()}#${encodeURIComponent(remark)}`;
 }
 
-async function getAdminSession(env) {
-  const raw = await env.VIRUS_PROXY_KV.get(KV_KEYS.ADMIN_SESSION);
-  if (!raw) return null;
-  try {
-    const session = JSON.parse(raw);
-    if (!session.token || session.expiresAt < Date.now()) return null;
-    return session;
-  } catch {
-    return null;
-  }
+function buildSubscriptionBase64(cfg, user) {
+	const link = buildVlessLink(cfg, user, `NovaProxy-${user.name || user.token.slice(0, 6)}`);
+	return btoa(unescape(encodeURIComponent(link)));
 }
 
-async function setAdminSession(env, token) {
-  const session = { token, expiresAt: Date.now() + SESSION_TTL_MS };
-  await env.VIRUS_PROXY_KV.put(KV_KEYS.ADMIN_SESSION, JSON.stringify(session));
-}
-
-async function clearAdminSession(env) {
-  await env.VIRUS_PROXY_KV.put(KV_KEYS.ADMIN_SESSION, JSON.stringify({ token: '', expiresAt: 0 }));
-}
-
-async function checkLoginRateLimit(env) {
-  const raw = await env.VIRUS_PROXY_KV.get(KV_KEYS.LOGIN_ATTEMPTS);
-  const now = Date.now();
-  let state = raw ? JSON.parse(raw) : { count: 0, windowStart: now };
-  if (now - state.windowStart > LOGIN_WINDOW_MS) {
-    state = { count: 0, windowStart: now };
-  }
-  return { allowed: state.count < LOGIN_MAX_ATTEMPTS, state };
-}
-
-async function recordLoginAttempt(env, state, success) {
-  if (success) {
-    await env.VIRUS_PROXY_KV.put(KV_KEYS.LOGIN_ATTEMPTS, JSON.stringify({ count: 0, windowStart: Date.now() }));
-    return;
-  }
-  const updated = { count: state.count + 1, windowStart: state.windowStart };
-  await env.VIRUS_PROXY_KV.put(KV_KEYS.LOGIN_ATTEMPTS, JSON.stringify(updated));
-}
-
-async function appendLog(env, message) {
-  try {
-    const raw = await env.VIRUS_PROXY_KV.get(KV_KEYS.LOGS);
-    const logs = raw ? JSON.parse(raw) : [];
-    logs.unshift({ time: new Date().toISOString(), message });
-    while (logs.length > MAX_LOG_ENTRIES) logs.pop();
-    await env.VIRUS_PROXY_KV.put(KV_KEYS.LOGS, JSON.stringify(logs));
-  } catch {
-    // logging must never break the request flow
-  }
-}
-
-async function getLogs(env) {
-  const raw = await env.VIRUS_PROXY_KV.get(KV_KEYS.LOGS);
-  if (!raw) return [];
-  try {
-    return JSON.parse(raw);
-  } catch {
-    return [];
-  }
-}
-
-// -----------------------------------------------------------------------------
-// Auth
-// -----------------------------------------------------------------------------
-
-async function requireAdmin(request, env) {
-  const authHeader = request.headers.get('Authorization') || '';
-  const match = authHeader.match(/^Bearer\s+(.+)$/i);
-  if (!match) return false;
-  const session = await getAdminSession(env);
-  if (!session) return false;
-  return safeEqual(match[1], session.token);
-}
-
-// -----------------------------------------------------------------------------
-// Subscription link generation
-// -----------------------------------------------------------------------------
-
-function buildVlessUri(user, settings) {
-  const params = new URLSearchParams({
-    type: 'ws',
-    security: 'tls',
-    path: settings.path,
-    host: settings.host,
-    sni: settings.sni,
-    fp: 'chrome',
-    encryption: 'none',
-  });
-  if (settings.fragment) params.set('fragment', settings.fragment);
-  if (settings.ech) params.set('ech', '1');
-
-  const label = encodeURIComponent(`${BRAND}-${user.name}`);
-  return `vless://${user.uuid}@${settings.host}:443?${params.toString()}#${label}`;
-}
-
-function buildClashYaml(user, settings) {
-  const proxyName = `${BRAND}-${user.name}`;
-  return `# ${BRAND} — Mihomo / Clash-Meta config
-# Generated for user: ${user.name}
-proxies:
-  - name: "${proxyName}"
+function buildClashYAML(cfg, user) {
+	const host = cfg.host;
+	const sni = cfg.sni || host;
+	return `proxies:
+  - name: "NovaProxy-${user.name || user.token.slice(0, 6)}"
     type: vless
-    server: ${settings.host}
+    server: ${host}
     port: 443
     uuid: ${user.uuid}
     network: ws
     tls: true
     udp: true
-    sni: ${settings.sni}
-    servername: ${settings.sni}
-    client-fingerprint: chrome
+    servername: ${sni}
     ws-opts:
-      path: "${settings.path}"
+      path: "${cfg.path}"
       headers:
-        Host: ${settings.host}
-
+        Host: ${host}
 proxy-groups:
-  - name: "${BRAND}"
+  - name: "NovaProxy"
     type: select
     proxies:
-      - "${proxyName}"
-
+      - "NovaProxy-${user.name || user.token.slice(0, 6)}"
 rules:
-  - MATCH,${BRAND}
+  - MATCH,NovaProxy
 `;
 }
 
-// -----------------------------------------------------------------------------
-// Virus Radar — deep scanner for low-latency Cloudflare edge IPs
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------
+// Health-Check: قبل از فعال کردن یک HOST جدید، واقعاً تست می‌کنیم
+// که TCP handshake روی پورت 443 آن انجام می‌شود (همان چیزی که
+// باعث "پینگ مثبت" در کلاینت‌ها می‌شود).
+// ---------------------------------------------------------------
 
-const CF_IP_RANGES = [
-  '104.16.0.0/12',
-  '162.159.0.0/16',
-  '172.64.0.0/13',
-  '188.114.96.0/20',
-  '198.41.128.0/17',
-];
-
-function ipToInt(ip) {
-  return ip.split('.').reduce((acc, octet) => (acc << 8) + parseInt(octet, 10), 0) >>> 0;
-}
-function intToIp(int) {
-  return [24, 16, 8, 0].map((shift) => (int >>> shift) & 255).join('.');
-}
-function randomIpInCidr(cidr) {
-  const [base, prefixStr] = cidr.split('/');
-  const prefix = parseInt(prefixStr, 10);
-  const baseInt = ipToInt(base);
-  const hostBits = 32 - prefix;
-  const hostMax = Math.pow(2, hostBits) - 1;
-  const randomHost = Math.floor(Math.random() * hostMax);
-  const mask = (~0 << hostBits) >>> 0;
-  const networkInt = baseInt & mask;
-  return intToIp((networkInt + randomHost) >>> 0);
-}
-function generateRandomCfIps(count) {
-  const ips = new Set();
-  let attempts = 0;
-  while (ips.size < count && attempts < count * 5) {
-    const range = CF_IP_RANGES[Math.floor(Math.random() * CF_IP_RANGES.length)];
-    ips.add(randomIpInCidr(range));
-    attempts++;
-  }
-  return Array.from(ips);
+async function tcpHealthCheck(hostOrIP, port = 443, timeoutMs = 3000) {
+	const start = Date.now();
+	try {
+		const socket = connect({ hostname: hostOrIP, port });
+		const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), timeoutMs));
+		await Promise.race([socket.opened, timeout]);
+		const latency = Date.now() - start;
+		try { socket.close(); } catch (e) {}
+		return { ok: true, latencyMs: latency };
+	} catch (e) {
+		return { ok: false, latencyMs: -1, error: String(e) };
+	}
 }
 
-async function scanIp(ip, timeoutMs = 2500) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  const started = Date.now();
-  try {
-    await fetch(`https://${ip}/cdn-cgi/trace`, {
-      method: 'HEAD',
-      headers: { Host: 'www.cloudflare.com' },
-      signal: controller.signal,
-    });
-    return { ip, latency: Date.now() - started, ok: true };
-  } catch {
-    return { ip, latency: null, ok: false };
-  } finally {
-    clearTimeout(timer);
-  }
+// این تابع توسط Cron صدا زده می‌شود: لیست IPهای کاندید ذخیره‌شده در KV را
+// از داخل Worker تست می‌کند تا مطمئن شود *فعلی* هنوز روی 443 پاسخ می‌دهد
+// و در صورت خراب بودن HOST فعلی، یکی از کاندیدهای سالم را جایگزین می‌کند.
+// توجه: این فقط سلامتِ اتصال از Cloudflare-به-Cloudflare را می‌سنجد،
+// نه سرعت از شبکه‌ی کاربر (آن بخش را پنل ادمین در مرورگر انجام می‌دهد).
+async function runHealthCheckAndFailover(env) {
+	const cfg = await getConfig(env);
+	const candidates = cfg.candidateIPs.length ? cfg.candidateIPs : [cfg.host].filter(Boolean);
+
+	const results = [];
+	for (const ip of candidates) {
+		const res = await tcpHealthCheck(ip, 443);
+		results.push({ ip, ...res });
+	}
+
+	// آی‌پی فعلی را هم چک می‌کنیم
+	const currentOK = cfg.host ? (await tcpHealthCheck(cfg.host, 443)).ok : false;
+
+	if (!currentOK) {
+		const healthy = results.filter(r => r.ok).sort((a, b) => a.latencyMs - b.latencyMs);
+		if (healthy.length > 0) {
+			const oldHost = cfg.host;
+			cfg.host = healthy[0].ip;
+			await addLog(env, 'auto-update', `HOST از ${oldHost || '(خالی)'} به ${cfg.host} تغییر کرد (Health-Check ناموفق روی قبلی)`);
+		} else {
+			await addLog(env, 'warning', 'هیچ‌کدام از IPهای کاندید سالم نبودند؛ HOST فعلی حفظ شد');
+		}
+	}
+
+	cfg.lastScanAt = Date.now();
+	cfg.lastScanResults = results;
+	await saveConfig(env, cfg);
 }
 
-/**
- * Runs scans in bounded-concurrency batches so a "deep" scan (a much larger
- * pool of candidate IPs) doesn't blow past Workers' subrequest limits or run
- * so many parallel fetches at once that results get noisy.
- */
-async function runRadarScan(ipList, poolSize, concurrency = 12) {
-  const list = Array.isArray(ipList) && ipList.length > 0 ? ipList : generateRandomCfIps(poolSize);
-  const results = [];
-  for (let i = 0; i < list.length; i += concurrency) {
-    const batch = list.slice(i, i + concurrency);
-    const batchResults = await Promise.all(batch.map((ip) => scanIp(ip)));
-    results.push(...batchResults);
-  }
-  return results
-    .filter((r) => r.ok)
-    .sort((a, b) => a.latency - b.latency)
-    .map((r) => ({ ip: r.ip, latency: r.latency }));
-}
+// ---------------------------------------------------------------
+// پنل مدیریت (HTML/CSS/JS)
+// ---------------------------------------------------------------
 
-async function getRadarCache(env) {
-  const raw = await env.VIRUS_PROXY_KV.get(KV_KEYS.RADAR_CACHE);
-  if (!raw) return null;
-  try {
-    return JSON.parse(raw);
-  } catch {
-    return null;
-  }
-}
-
-async function saveRadarCache(env, results) {
-  const cache = { scannedAt: new Date().toISOString(), results };
-  await env.VIRUS_PROXY_KV.put(KV_KEYS.RADAR_CACHE, JSON.stringify(cache));
-  return cache;
-}
-
-// -----------------------------------------------------------------------------
-// VLESS protocol parsing
-// -----------------------------------------------------------------------------
-
-function parseVlessHeader(buffer, expectedUuid) {
-  if (buffer.byteLength < 24) return { hasError: true, message: 'VLESS header too short' };
-  const view = new DataView(buffer);
-  const version = view.getUint8(0);
-
-  const uuidBytes = new Uint8Array(buffer.slice(1, 17));
-  const uuidHex = Array.from(uuidBytes).map((b) => b.toString(16).padStart(2, '0')).join('');
-  const formattedUuid = [
-    uuidHex.slice(0, 8),
-    uuidHex.slice(8, 12),
-    uuidHex.slice(12, 16),
-    uuidHex.slice(16, 20),
-    uuidHex.slice(20, 32),
-  ].join('-');
-
-  if (!safeEqual(formattedUuid, expectedUuid)) return { hasError: true, message: 'UUID mismatch' };
-
-  const addonsLength = view.getUint8(17);
-  let offset = 18 + addonsLength;
-
-  const command = view.getUint8(offset);
-  offset += 1;
-  if (command !== 1 && command !== 2) return { hasError: true, message: `Unsupported command: ${command}` };
-  const isUDP = command === 2;
-
-  const port = view.getUint16(offset, false);
-  offset += 2;
-
-  const addressType = view.getUint8(offset);
-  offset += 1;
-
-  let addressRemote = '';
-  if (addressType === 1) {
-    addressRemote = Array.from(new Uint8Array(buffer.slice(offset, offset + 4))).join('.');
-    offset += 4;
-  } else if (addressType === 2) {
-    const domainLength = view.getUint8(offset);
-    offset += 1;
-    addressRemote = new TextDecoder().decode(buffer.slice(offset, offset + domainLength));
-    offset += domainLength;
-  } else if (addressType === 3) {
-    const segments = [];
-    for (let i = 0; i < 8; i++) {
-      segments.push(view.getUint16(offset, false).toString(16));
-      offset += 2;
-    }
-    addressRemote = segments.join(':');
-  } else {
-    return { hasError: true, message: `Unsupported address type: ${addressType}` };
-  }
-
-  return { hasError: false, vlessVersion: version, addressRemote, portRemote: port, isUDP, rawDataIndex: offset };
-}
-
-// -----------------------------------------------------------------------------
-// User validation helpers (total quota + daily quota + expiry + kill switch)
-// -----------------------------------------------------------------------------
-
-function dailyWindowStart(ts) {
-  const d = new Date(ts);
-  d.setUTCHours(0, 0, 0, 0);
-  return d.getTime();
-}
-
-function rolloverDailyUsageIfNeeded(user) {
-  const todayStart = dailyWindowStart(Date.now());
-  if (!user.dailyResetAt || user.dailyResetAt < todayStart) {
-    user.dailyUsedBytes = 0;
-    user.dailyResetAt = todayStart;
-  }
-  return user;
-}
-
-function userIsUsable(user, settings) {
-  if (settings.killSwitch) return { ok: false, reason: 'Service temporarily disabled (kill switch is on)' };
-  if (!user) return { ok: false, reason: 'User not found' };
-  if (!user.enabled) return { ok: false, reason: 'User disabled' };
-  if (user.expiry && new Date(user.expiry).getTime() < Date.now()) {
-    return { ok: false, reason: 'Subscription expired' };
-  }
-  rolloverDailyUsageIfNeeded(user);
-  if (user.quotaBytes > 0 && (user.usedBytes || 0) >= user.quotaBytes) {
-    return { ok: false, reason: 'Total quota exceeded' };
-  }
-  if (user.dailyQuotaBytes > 0 && (user.dailyUsedBytes || 0) >= user.dailyQuotaBytes) {
-    return { ok: false, reason: 'Daily quota exceeded' };
-  }
-  return { ok: true };
-}
-
-function findUserByToken(users, token) {
-  return users.find((u) => u.token === token);
-}
-
-// -----------------------------------------------------------------------------
-// WebSocket <-> TCP bridge (the actual proxy tunnel)
-// -----------------------------------------------------------------------------
-
-async function handleVlessWebSocket(request, env, user) {
-  const pair = new WebSocketPair();
-  const [client, server] = Object.values(pair);
-  server.accept();
-
-  let tcpSocket = null;
-  let usedBytesDelta = 0;
-
-  const closeWithError = (message) => {
-    try {
-      server.close(1011, message.slice(0, 120));
-    } catch {
-      /* already closed */
-    }
-  };
-
-  const flushUsage = async () => {
-    if (usedBytesDelta <= 0) return;
-    try {
-      const users = await getUsers(env);
-      const idx = users.findIndex((u) => u.id === user.id);
-      if (idx !== -1) {
-        rolloverDailyUsageIfNeeded(users[idx]);
-        users[idx].usedBytes = (users[idx].usedBytes || 0) + usedBytesDelta;
-        users[idx].dailyUsedBytes = (users[idx].dailyUsedBytes || 0) + usedBytesDelta;
-        await saveUsers(env, users);
-      }
-    } catch {
-      // never let accounting errors break the tunnel
-    } finally {
-      usedBytesDelta = 0;
-    }
-  };
-
-  server.addEventListener('message', async (event) => {
-    try {
-      const chunk = event.data instanceof ArrayBuffer ? event.data : await event.data.arrayBuffer();
-
-      if (!tcpSocket) {
-        const parsed = parseVlessHeader(chunk, user.uuid);
-        if (parsed.hasError) return closeWithError(parsed.message);
-        if (parsed.isUDP) return closeWithError('UDP not supported');
-
-        const settings = await getSettings(env);
-        const check = userIsUsable(user, settings);
-        if (!check.ok) return closeWithError(check.reason);
-
-        try {
-          tcpSocket = connect({ hostname: parsed.addressRemote, port: parsed.portRemote });
-        } catch (err) {
-          return closeWithError('TCP connect failed: ' + err.message);
-        }
-
-        server.send(new Uint8Array([parsed.vlessVersion, 0]).buffer);
-
-        const writer = tcpSocket.writable.getWriter();
-        (async () => {
-          try {
-            const reader = tcpSocket.readable.getReader();
-            while (true) {
-              const { value, done } = await reader.read();
-              if (done) break;
-              if (server.readyState === WS_READY_STATE_OPEN) {
-                server.send(value);
-                usedBytesDelta += value.byteLength;
-                if (usedBytesDelta > 262144) await flushUsage();
-              }
-            }
-          } catch {
-            /* upstream closed or errored */
-          } finally {
-            await flushUsage();
-            if (server.readyState === WS_READY_STATE_OPEN) server.close(1000, 'upstream closed');
-          }
-        })();
-
-        const initialPayload = chunk.slice(parsed.rawDataIndex);
-        if (initialPayload.byteLength > 0) {
-          await writer.write(new Uint8Array(initialPayload));
-          usedBytesDelta += initialPayload.byteLength;
-        }
-        tcpSocket.__writer = writer;
-        return;
-      }
-
-      await tcpSocket.__writer.write(new Uint8Array(chunk));
-      usedBytesDelta += chunk.byteLength;
-      if (usedBytesDelta > 262144) await flushUsage();
-    } catch (err) {
-      closeWithError('Relay error: ' + err.message);
-    }
-  });
-
-  server.addEventListener('close', async () => {
-    await flushUsage();
-    try {
-      if (tcpSocket) await tcpSocket.close();
-    } catch {
-      /* ignore */
-    }
-  });
-
-  server.addEventListener('error', async () => {
-    await flushUsage();
-    try {
-      if (tcpSocket) await tcpSocket.close();
-    } catch {
-      /* ignore */
-    }
-  });
-
-  return new Response(null, { status: 101, webSocket: client });
-}
-
-// -----------------------------------------------------------------------------
-// Admin panel HTML (Persian/RTL, dark "virus" theme, Vazirmatn font)
-// -----------------------------------------------------------------------------
-
-function renderAdminPanel() {
-  return `<!DOCTYPE html>
-<html lang="fa" dir="rtl">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>${BRAND} | پنل مدیریت</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+function loginPageHTML() {
+	return `<!DOCTYPE html>
+<html lang="fa" dir="rtl"><head><meta charset="utf-8">
+<title>ورود به پنل Nova Proxy</title>
 <style>
-@font-face {
-  font-family: 'Vazirmatn';
-  src: url('https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/fonts/webfont/woff2/Vazirmatn-Regular.woff2') format('woff2');
-  font-weight: 400;
+body{font-family:Tahoma,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;height:100vh;align-items:center;justify-content:center;margin:0}
+.box{background:#1e293b;padding:32px;border-radius:12px;width:300px;box-shadow:0 8px 24px rgba(0,0,0,.4)}
+h2{margin-top:0;text-align:center}
+input{width:100%;box-sizing:border-box;padding:10px;margin:8px 0;border-radius:6px;border:1px solid #334155;background:#0f172a;color:#fff}
+button{width:100%;padding:10px;border:none;border-radius:6px;background:#6366f1;color:#fff;font-weight:bold;cursor:pointer;margin-top:8px}
+button:hover{background:#4f46e5}
+.err{color:#f87171;text-align:center;font-size:13px;min-height:16px}
+</style></head>
+<body><div class="box">
+<h2>🌌 Nova Proxy</h2>
+<form id="f">
+<input type="password" id="pass" placeholder="رمز ادمین" required>
+<button type="submit">ورود</button>
+<div class="err" id="err"></div>
+</form></div>
+<script>
+document.getElementById('f').addEventListener('submit', async (e) => {
+	e.preventDefault();
+	const pass = document.getElementById('pass').value;
+	const res = await fetch('/admin/api/login', { method: 'POST', headers: {'content-type':'application/json'}, body: JSON.stringify({pass}) });
+	if (res.ok) { location.href = '/admin'; } else { document.getElementById('err').textContent = 'رمز اشتباه است'; }
+});
+</script>
+</body></html>`;
 }
-@font-face {
-  font-family: 'Vazirmatn';
-  src: url('https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/fonts/webfont/woff2/Vazirmatn-Bold.woff2') format('woff2');
-  font-weight: 700;
-}
-:root {
-  --bg: #0b0e14; --bg-card: #121722; --border: #1f2937;
-  --green: #0f9; --blue: #3b82f6; --purple: #a855f7;
-  --text: #e5e7eb; --text-dim: #94a3b8; --danger: #f87171;
-}
-* { box-sizing: border-box; }
-body { margin:0; background:var(--bg); color:var(--text); font-family:'Vazirmatn',Tahoma,sans-serif; min-height:100vh; }
-.container { max-width:1100px; margin:0 auto; padding:20px; }
-h1 { color:var(--green); font-size:22px; display:flex; align-items:center; gap:8px; }
-h2 { font-size:17px; color:var(--blue); margin-top:0; }
-.card { background:var(--bg-card); border:1px solid var(--border); border-radius:14px; padding:18px; margin-bottom:18px; }
-input, select { background:#0e1420; border:1px solid var(--border); color:var(--text); border-radius:8px; padding:9px 10px; font-family:inherit; font-size:14px; width:100%; }
-label { font-size:12px; color:var(--text-dim); display:block; margin-bottom:4px; }
-.field { margin-bottom:12px; }
-.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:12px; }
-button { background:linear-gradient(135deg,var(--green),#0c7); color:#05170f; border:none; border-radius:8px; padding:10px 16px; font-weight:700; cursor:pointer; font-family:inherit; font-size:14px; }
-button.secondary { background:var(--blue); color:#fff; }
-button.purple { background:var(--purple); color:#fff; }
-button.danger { background:var(--danger); color:#2b0505; }
-button.ghost { background:transparent; border:1px solid var(--border); color:var(--text); }
-table { width:100%; border-collapse:collapse; font-size:13px; }
-.table-wrap { overflow-x:auto; }
-th, td { padding:8px 6px; border-bottom:1px solid var(--border); text-align:right; white-space:nowrap; }
-th { color:var(--text-dim); font-weight:600; }
-.badge { padding:2px 8px; border-radius:999px; font-size:11px; }
-.badge.on { background:rgba(0,255,153,.15); color:var(--green); }
-.badge.off { background:rgba(248,113,113,.15); color:var(--danger); }
-.toast { position:fixed; bottom:20px; left:50%; transform:translateX(-50%); background:#111827; border:1px solid var(--border); color:var(--text); padding:12px 20px; border-radius:10px; display:none; z-index:999; }
-.hidden { display:none !important; }
-.login-box { max-width:360px; margin:80px auto; text-align:center; }
-.actions { display:flex; gap:6px; flex-wrap:wrap; }
-.small { font-size:12px; padding:6px 10px; }
-.kill-banner { background:rgba(248,113,113,.15); border:1px solid var(--danger); color:var(--danger); padding:10px 14px; border-radius:10px; margin-bottom:14px; font-size:13px; }
-#qrModal { position:fixed; inset:0; background:rgba(0,0,0,.7); display:none; align-items:center; justify-content:center; z-index:1000; }
-#qrModal .box { background:var(--bg-card); border:1px solid var(--border); border-radius:14px; padding:20px; text-align:center; }
-#qrCanvas { background:#fff; padding:10px; border-radius:8px; display:inline-block; margin:10px 0; }
-.log-line { font-size:12px; color:var(--text-dim); padding:6px 0; border-bottom:1px solid var(--border); }
-.log-line span { color:var(--green); }
-</style>
-</head>
+
+function adminPageHTML() {
+	// پنل کامل: مدیریت کاربران، تنظیمات HOST، Kill Switch، لاگ‌ها و اسکنر IP سمت مرورگر
+	return `<!DOCTYPE html>
+<html lang="fa" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>پنل مدیریت Nova Proxy</title>
+<style>
+:root{--bg:#0f172a;--card:#1e293b;--acc:#6366f1;--acc2:#22c55e;--danger:#ef4444;--text:#e2e8f0;--muted:#94a3b8}
+*{box-sizing:border-box}
+body{font-family:Tahoma,sans-serif;background:var(--bg);color:var(--text);margin:0;padding:20px}
+h1{font-size:20px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}
+.card{background:var(--card);border-radius:12px;padding:18px;box-shadow:0 4px 16px rgba(0,0,0,.3)}
+.card h3{margin-top:0;border-bottom:1px solid #334155;padding-bottom:8px}
+input,select{width:100%;padding:8px;margin:4px 0;border-radius:6px;border:1px solid #334155;background:#0f172a;color:#fff}
+button{padding:8px 14px;border:none;border-radius:6px;background:var(--acc);color:#fff;cursor:pointer;margin:4px 2px}
+button:hover{opacity:.9}
+button.danger{background:var(--danger)}
+button.green{background:var(--acc2)}
+table{width:100%;border-collapse:collapse;font-size:13px}
+td,th{padding:6px;border-bottom:1px solid #334155;text-align:right}
+.pill{padding:2px 8px;border-radius:20px;font-size:11px}
+.pill.ok{background:#14532d;color:#86efac}
+.pill.bad{background:#7f1d1d;color:#fca5a5}
+.small{font-size:12px;color:var(--muted)}
+.log{max-height:220px;overflow:auto;font-size:12px}
+.kv{display:flex;justify-content:space-between;margin-top:8px}
+</style></head>
 <body>
-<div class="container">
+<h1>🌌 پنل مدیریت Nova Proxy</h1>
+<div class="grid">
 
-  <div id="loginView" class="login-box card">
-    <h1>🦠 ${BRAND}</h1>
-    <p style="color:var(--text-dim)">برای ورود به پنل مدیریت رمز عبور را وارد کنید</p>
-    <div class="field"><input type="password" id="loginPass" placeholder="رمز عبور ادمین"></div>
-    <button onclick="doLogin()" style="width:100%">ورود</button>
+  <div class="card">
+    <h3>وضعیت کلی</h3>
+    <div class="kv"><span>HOST فعلی:</span><b id="curHost">-</b></div>
+    <div class="kv"><span>آخرین اسکن:</span><span id="lastScan">-</span></div>
+    <div class="kv"><span>Kill Switch:</span><span id="ksStatus">-</span></div>
+    <button class="danger" onclick="toggleKillSwitch()">تغییر وضعیت Kill Switch</button>
+    <button onclick="runServerHealthCheck()">اجرای Health-Check دستی</button>
   </div>
 
-  <div id="mainView" class="hidden">
-    <h1>🦠 ${BRAND} — پنل مدیریت</h1>
-    <div id="killBanner" class="kill-banner hidden">⚠️ کلید قطع کامل (Kill Switch) فعال است — همه‌ی اتصالات مسدود شده‌اند.</div>
-
-    <div class="card">
-      <h2>⚙️ تنظیمات عمومی</h2>
-      <div class="grid">
-        <div class="field"><label>HOST</label><input id="setHost"></div>
-        <div class="field"><label>PATH</label><input id="setPath"></div>
-        <div class="field"><label>SNI (جعل دامنه)</label><input id="setSni"></div>
-        <div class="field"><label>FRAGMENT</label><input id="setFragment"></div>
-      </div>
-      <label style="display:flex;align-items:center;gap:6px;margin-bottom:8px"><input type="checkbox" id="setEch" style="width:auto"> فعال‌سازی ECH (اختیاری)</label>
-      <label style="display:flex;align-items:center;gap:6px;margin-bottom:12px"><input type="checkbox" id="setKill" style="width:auto"> 🔴 Kill Switch — قطع فوری همه‌ی اتصالات</label>
-      <button onclick="saveSettings()">ذخیره تنظیمات</button>
-    </div>
-
-    <div class="card">
-      <h2>👥 مدیریت کاربران</h2>
-      <div class="grid">
-        <div class="field"><label>نام</label><input id="newName" placeholder="مثلا: علی"></div>
-        <div class="field"><label>نام کاربری (اختیاری)</label><input id="newUsername"></div>
-        <div class="field"><label>سقف کل (گیگابایت، ۰=نامحدود)</label><input id="newQuota" type="number" value="0"></div>
-        <div class="field"><label>سقف روزانه (گیگابایت، ۰=نامحدود)</label><input id="newDailyQuota" type="number" value="0"></div>
-        <div class="field"><label>تاریخ انقضا (اختیاری)</label><input id="newExpiry" type="date"></div>
-      </div>
-      <button onclick="createUser()">➕ ایجاد کاربر</button>
-
-      <div class="table-wrap" style="margin-top:16px">
-        <table>
-          <thead><tr><th>نام</th><th>وضعیت</th><th>انقضا</th><th>ترافیک کل</th><th>ترافیک روزانه</th><th>اشتراک</th><th>عملیات</th></tr></thead>
-          <tbody id="usersTableBody"></tbody>
-        </table>
-      </div>
-    </div>
-
-    <div class="card">
-      <h2>🔍 Virus Radar</h2>
-      <p style="color:var(--text-dim);font-size:13px">اسکن عمیق آی‌پی‌های Cloudflare برای یافتن سریع‌ترین مسیر از شبکه‌ی خودت</p>
-      <div id="radarMeta" style="color:var(--text-dim);font-size:12px;margin-bottom:8px"></div>
-      <div class="actions">
-        <button onclick="startScan(60)">🔍 اسکن سریع (۶۰ IP)</button>
-        <button class="purple" onclick="startScan(200)">🧬 اسکن عمیق (۲۰۰ IP)</button>
-      </div>
-      <div class="table-wrap" style="margin-top:12px">
-        <table>
-          <thead><tr><th>IP</th><th>تأخیر (ms)</th><th></th></tr></thead>
-          <tbody id="radarTableBody"></tbody>
-        </table>
-      </div>
-    </div>
-
-    <div class="card">
-      <h2>📜 لاگ فعالیت</h2>
-      <button class="ghost small" onclick="loadLogs()">به‌روزرسانی لاگ</button>
-      <div id="logsBox" style="margin-top:10px;max-height:240px;overflow-y:auto"></div>
-    </div>
-
-    <div class="card">
-      <h2>🔑 تغییر رمز عبور ادمین</h2>
-      <button class="secondary" onclick="changePassword()">تغییر رمز عبور</button>
-    </div>
+  <div class="card">
+    <h3>اسکن IP از شبکه‌ی شما (مرورگر)</h3>
+    <p class="small">این تست از همین مرورگر/گوشی شما اجرا می‌شود، پس تأخیر واقعی شبکه‌ی خودتان را نشان می‌دهد؛ نه شبکه‌ی Cloudflare.</p>
+    <textarea id="ipList" rows="4" placeholder="یک IP یا دامنه در هر خط"></textarea>
+    <button onclick="scanFromBrowser()">شروع اسکن</button>
+    <div id="scanResults" class="small"></div>
+    <button class="green" onclick="applyBestIP()">اعمال بهترین IP به‌عنوان HOST</button>
   </div>
+
+  <div class="card">
+    <h3>تنظیمات اتصال</h3>
+    <label class="small">PATH</label><input id="cfgPath">
+    <label class="small">SNI (خالی = HOST)</label><input id="cfgSni">
+    <label class="small">Fragment</label><input id="cfgFragment">
+    <label class="small">ECH (اختیاری)</label><input id="cfgEch">
+    <button onclick="saveCfg()">ذخیره تنظیمات</button>
+  </div>
+
+  <div class="card">
+    <h3>افزودن کاربر جدید</h3>
+    <input id="uName" placeholder="نام کاربر">
+    <input id="uTrafficTotal" placeholder="سقف ترافیک کل (GB) - 0 = نامحدود" type="number">
+    <input id="uTrafficDaily" placeholder="سقف ترافیک روزانه (GB) - 0 = نامحدود" type="number">
+    <input id="uExpireDays" placeholder="انقضا (روز) - 0 = نامحدود" type="number">
+    <button class="green" onclick="createUser()">ایجاد کاربر</button>
+  </div>
+
+  <div class="card" style="grid-column:1/-1">
+    <h3>لیست کاربران</h3>
+    <table id="usersTable">
+      <thead><tr><th>نام</th><th>مصرف کل/سقف</th><th>مصرف امروز/سقف</th><th>انقضا</th><th>وضعیت</th><th>لینک اشتراک</th><th>عملیات</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <div class="card" style="grid-column:1/-1">
+    <h3>لاگ فعالیت</h3>
+    <div class="log" id="logBox"></div>
+  </div>
+
 </div>
-
-<div id="qrModal">
-  <div class="box">
-    <div id="qrCanvas"></div>
-    <div><button class="ghost small" onclick="document.getElementById('qrModal').style.display='none'">بستن</button></div>
-  </div>
-</div>
-
-<div class="toast" id="toast"></div>
 
 <script>
-let ADMIN_TOKEN = localStorage.getItem('vp_token') || '';
-
-function showToast(msg, isError) {
-  const t = document.getElementById('toast');
-  t.textContent = msg;
-  t.style.borderColor = isError ? 'var(--danger)' : 'var(--green)';
-  t.style.display = 'block';
-  clearTimeout(window.__toastTimer);
-  window.__toastTimer = setTimeout(() => (t.style.display = 'none'), 3000);
+async function api(path, opts) {
+	const res = await fetch(path, Object.assign({ headers: { 'content-type': 'application/json' } }, opts || {}));
+	if (res.status === 401) { location.href = '/admin'; return null; }
+	return res.json().catch(() => ({}));
 }
 
-async function api(path, options = {}) {
-  const headers = options.headers || {};
-  if (ADMIN_TOKEN) headers['Authorization'] = 'Bearer ' + ADMIN_TOKEN;
-  if (options.body) headers['Content-Type'] = 'application/json';
-  const res = await fetch(path, { ...options, headers });
-  if (res.status === 401) {
-    localStorage.removeItem('vp_token');
-    showToast('نشست شما منقضی شده، دوباره وارد شوید', true);
-    showLogin();
-    throw new Error('unauthorized');
-  }
-  return res.json();
+async function loadAll() {
+	const cfg = await api('/admin/api/config');
+	document.getElementById('curHost').textContent = cfg.host || '(تنظیم نشده)';
+	document.getElementById('lastScan').textContent = cfg.lastScanAt ? new Date(cfg.lastScanAt).toLocaleString('fa-IR') : '-';
+	document.getElementById('ksStatus').textContent = cfg.killSwitch ? '🔴 فعال (همه اتصالات قطع)' : '🟢 غیرفعال';
+	document.getElementById('cfgPath').value = cfg.path || '';
+	document.getElementById('cfgSni').value = cfg.sni || '';
+	document.getElementById('cfgFragment').value = cfg.fragment || '';
+	document.getElementById('cfgEch').value = cfg.ech || '';
+	document.getElementById('ipList').value = (cfg.candidateIPs || []).join('\\n');
+
+	const users = await api('/admin/api/users');
+	const tbody = document.querySelector('#usersTable tbody');
+	tbody.innerHTML = '';
+	for (const u of users) {
+		const tr = document.createElement('tr');
+		const totalLimit = u.trafficLimitTotal ? (u.trafficLimitTotal/1e9).toFixed(1)+'GB' : '∞';
+		const dailyLimit = u.trafficLimitDaily ? (u.trafficLimitDaily/1e9).toFixed(1)+'GB' : '∞';
+		const exp = u.expiresAt ? new Date(u.expiresAt).toLocaleDateString('fa-IR') : 'نامحدود';
+		tr.innerHTML = \`
+			<td>\${u.name || u.token.slice(0,6)}</td>
+			<td>\${((u.trafficUsedTotal||0)/1e9).toFixed(2)}GB / \${totalLimit}</td>
+			<td>\${((u.trafficUsedDaily||0)/1e9).toFixed(2)}GB / \${dailyLimit}</td>
+			<td>\${exp}</td>
+			<td><span class="pill \${u.active?'ok':'bad'}">\${u.active?'فعال':'غیرفعال'}</span></td>
+			<td><button onclick="copySub('\${u.token}')">کپی لینک</button></td>
+			<td>
+				<button onclick="toggleUser('\${u.token}')">فعال/غیرفعال</button>
+				<button class="danger" onclick="removeUser('\${u.token}')">حذف</button>
+			</td>\`;
+		tbody.appendChild(tr);
+	}
+
+	const logs = await api('/admin/api/logs');
+	document.getElementById('logBox').innerHTML = logs.map(l =>
+		\`<div>[\${new Date(l.time).toLocaleTimeString('fa-IR')}] <b>\${l.type}</b>: \${l.message}</div>\`
+	).join('');
 }
 
-function showLogin() {
-  document.getElementById('loginView').classList.remove('hidden');
-  document.getElementById('mainView').classList.add('hidden');
-}
-function showMain() {
-  document.getElementById('loginView').classList.add('hidden');
-  document.getElementById('mainView').classList.remove('hidden');
-  loadSettings();
-  loadUsers();
-  loadRadarCache();
-  loadLogs();
+async function saveCfg() {
+	await api('/admin/api/config', { method: 'POST', body: JSON.stringify({
+		path: document.getElementById('cfgPath').value,
+		sni: document.getElementById('cfgSni').value,
+		fragment: document.getElementById('cfgFragment').value,
+		ech: document.getElementById('cfgEch').value,
+		candidateIPs: document.getElementById('ipList').value.split('\\n').map(s=>s.trim()).filter(Boolean),
+	})});
+	loadAll();
 }
 
-async function doLogin() {
-  const password = document.getElementById('loginPass').value;
-  try {
-    const res = await fetch('/admin/login', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password }),
-    });
-    const data = await res.json();
-    if (data.token) {
-      ADMIN_TOKEN = data.token;
-      localStorage.setItem('vp_token', ADMIN_TOKEN);
-      showToast('ورود موفق');
-      showMain();
-    } else {
-      showToast(data.error || 'رمز عبور اشتباه است', true);
-    }
-  } catch { showToast('خطا در ورود', true); }
-}
-
-async function loadSettings() {
-  const data = await api('/admin/settings');
-  document.getElementById('setHost').value = data.host || '';
-  document.getElementById('setPath').value = data.path || '';
-  document.getElementById('setSni').value = data.sni || '';
-  document.getElementById('setFragment').value = data.fragment || '';
-  document.getElementById('setEch').checked = !!data.ech;
-  document.getElementById('setKill').checked = !!data.killSwitch;
-  document.getElementById('killBanner').classList.toggle('hidden', !data.killSwitch);
-}
-
-async function saveSettings() {
-  const body = {
-    host: document.getElementById('setHost').value,
-    path: document.getElementById('setPath').value,
-    sni: document.getElementById('setSni').value,
-    fragment: document.getElementById('setFragment').value,
-    ech: document.getElementById('setEch').checked,
-    killSwitch: document.getElementById('setKill').checked,
-  };
-  await api('/admin/settings', { method: 'POST', body: JSON.stringify(body) });
-  document.getElementById('killBanner').classList.toggle('hidden', !body.killSwitch);
-  showToast('تنظیمات ذخیره شد');
-}
-
-function fmtBytes(n) {
-  if (!n) return '0';
-  const units = ['B','KB','MB','GB','TB'];
-  let i = 0;
-  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
-  return n.toFixed(1) + ' ' + units[i];
-}
-
-async function loadUsers() {
-  const users = await api('/admin/users');
-  const body = document.getElementById('usersTableBody');
-  body.innerHTML = '';
-  users.forEach((u) => {
-    const totalText = u.quotaBytes > 0 ? fmtBytes(u.usedBytes||0) + ' / ' + fmtBytes(u.quotaBytes) : fmtBytes(u.usedBytes||0) + ' / ∞';
-    const dailyText = u.dailyQuotaBytes > 0 ? fmtBytes(u.dailyUsedBytes||0) + ' / ' + fmtBytes(u.dailyQuotaBytes) : fmtBytes(u.dailyUsedBytes||0) + ' / ∞';
-    const tr = document.createElement('tr');
-    tr.innerHTML = \`
-      <td>\${u.name}</td>
-      <td><span class="badge \${u.enabled ? 'on':'off'}">\${u.enabled ? 'فعال':'غیرفعال'}</span></td>
-      <td>\${u.expiry ? new Date(u.expiry).toLocaleDateString('fa-IR') : 'نامحدود'}</td>
-      <td>\${totalText}</td>
-      <td>\${dailyText}</td>
-      <td><div class="actions">
-        <button class="ghost small" onclick="copySub('\${u.token}','base64')">کپی لینک</button>
-        <button class="ghost small" onclick="copySub('\${u.token}','clash')">Clash</button>
-        <button class="ghost small" onclick="showQr('\${u.token}')">QR</button>
-      </div></td>
-      <td><div class="actions">
-        <button class="secondary small" onclick="toggleUser('\${u.id}', \${!u.enabled})">\${u.enabled ? 'غیرفعال':'فعال'}</button>
-        <button class="danger small" onclick="deleteUser('\${u.id}')">حذف</button>
-      </div></td>
-    \`;
-    body.appendChild(tr);
-  });
-}
+async function toggleKillSwitch() { await api('/admin/api/killswitch', { method: 'POST' }); loadAll(); }
+async function runServerHealthCheck() { await api('/admin/api/healthcheck', { method: 'POST' }); loadAll(); }
 
 async function createUser() {
-  const name = document.getElementById('newName').value.trim();
-  if (!name) return showToast('نام کاربر را وارد کنید', true);
-  const quotaGb = parseFloat(document.getElementById('newQuota').value || '0');
-  const dailyGb = parseFloat(document.getElementById('newDailyQuota').value || '0');
-  const body = {
-    name,
-    username: document.getElementById('newUsername').value.trim(),
-    quotaBytes: Math.round(quotaGb * 1024**3),
-    dailyQuotaBytes: Math.round(dailyGb * 1024**3),
-    expiry: document.getElementById('newExpiry').value || null,
-  };
-  await api('/admin/user', { method: 'POST', body: JSON.stringify(body) });
-  showToast('کاربر ایجاد شد');
-  document.getElementById('newName').value = '';
-  document.getElementById('newUsername').value = '';
-  loadUsers();
+	await api('/admin/api/users', { method: 'POST', body: JSON.stringify({
+		name: document.getElementById('uName').value,
+		trafficLimitTotal: Number(document.getElementById('uTrafficTotal').value || 0) * 1e9,
+		trafficLimitDaily: Number(document.getElementById('uTrafficDaily').value || 0) * 1e9,
+		expireDays: Number(document.getElementById('uExpireDays').value || 0),
+	})});
+	loadAll();
+}
+async function toggleUser(token) { await api('/admin/api/users/' + token + '/toggle', { method: 'POST' }); loadAll(); }
+async function removeUser(token) { if(confirm('حذف شود؟')) { await api('/admin/api/users/' + token, { method: 'DELETE' }); loadAll(); } }
+async function copySub(token) {
+	const url = location.origin + '/sub?token=' + token;
+	await navigator.clipboard.writeText(url);
+	alert('لینک اشتراک کپی شد:\\n' + url);
 }
 
-async function toggleUser(id, enabled) {
-  await api('/admin/user/' + id, { method: 'PUT', body: JSON.stringify({ enabled }) });
-  loadUsers();
+// ---- اسکنر IP سمت مرورگر (تأخیر واقعی شبکه‌ی کاربر) ----
+let lastScanBest = null;
+async function scanFromBrowser() {
+	const ips = document.getElementById('ipList').value.split('\\n').map(s=>s.trim()).filter(Boolean);
+	const resultsDiv = document.getElementById('scanResults');
+	resultsDiv.innerHTML = 'در حال اسکن...';
+	const results = [];
+	for (const ip of ips) {
+		const t0 = performance.now();
+		try {
+			// درخواست HEAD به cdn-cgi/trace که همه IPهای کلودفلر پاسخ می‌دهند (HTTPing واقعی)
+			await fetch('https://' + ip + '/cdn-cgi/trace', { mode: 'no-cors', cache: 'no-store' });
+			const latency = Math.round(performance.now() - t0);
+			results.push({ ip, latency, ok: true });
+		} catch (e) {
+			results.push({ ip, latency: -1, ok: false });
+		}
+	}
+	results.sort((a,b) => (a.ok?a.latency:1e9) - (b.ok?b.latency:1e9));
+	lastScanBest = results.find(r => r.ok) || null;
+	resultsDiv.innerHTML = results.map(r => \`\${r.ip}: \${r.ok ? r.latency+'ms' : 'ناموفق'}\`).join('<br>');
 }
-async function deleteUser(id) {
-  if (!confirm('کاربر حذف شود؟')) return;
-  await api('/admin/user/' + id, { method: 'DELETE' });
-  showToast('کاربر حذف شد');
-  loadUsers();
-}
-
-function subUrl(token, kind) {
-  return kind === 'clash' ? location.origin + '/sub/mihomo.yaml?token=' + token : location.origin + '/sub?token=' + token;
-}
-async function copySub(token, kind) {
-  const url = subUrl(token, kind);
-  try { await navigator.clipboard.writeText(url); showToast('لینک اشتراک کپی شد'); }
-  catch { prompt('لینک را کپی کنید:', url); }
-}
-function showQr(token) {
-  const el = document.getElementById('qrCanvas');
-  el.innerHTML = '';
-  new QRCode(el, { text: subUrl(token, 'base64'), width: 220, height: 220 });
-  document.getElementById('qrModal').style.display = 'flex';
-}
-
-async function loadRadarCache() {
-  const data = await api('/radar/cache');
-  if (data && data.results && data.results.length) {
-    renderRadarResults(data.results);
-    document.getElementById('radarMeta').textContent = 'آخرین اسکن: ' + new Date(data.scannedAt).toLocaleString('fa-IR');
-  }
-}
-function renderRadarResults(results) {
-  const body = document.getElementById('radarTableBody');
-  body.innerHTML = '';
-  results.forEach((r) => {
-    const tr = document.createElement('tr');
-    tr.innerHTML = \`<td>\${r.ip}</td><td>\${r.latency}</td><td><button class="ghost small" onclick="applyIp('\${r.ip}')">اعمال</button></td>\`;
-    body.appendChild(tr);
-  });
-}
-async function startScan(poolSize) {
-  showToast('در حال اسکن عمیق... چند ثانیه صبر کنید');
-  const data = await api('/radar/scan', { method: 'POST', body: JSON.stringify({ poolSize }) });
-  renderRadarResults(data.results || []);
-  document.getElementById('radarMeta').textContent = 'آخرین اسکن: همین الان';
-  showToast('اسکن کامل شد: ' + (data.results||[]).length + ' نتیجه سالم');
-}
-async function applyIp(ip) {
-  await api('/radar/apply', { method: 'POST', body: JSON.stringify({ host: ip }) });
-  showToast('HOST به‌روزرسانی شد: ' + ip);
-  loadSettings();
+async function applyBestIP() {
+	if (!lastScanBest) { alert('اول اسکن کنید'); return; }
+	await api('/admin/api/apply-host', { method: 'POST', body: JSON.stringify({ host: lastScanBest.ip, latency: lastScanBest.latency }) });
+	loadAll();
 }
 
-async function loadLogs() {
-  const logs = await api('/admin/logs');
-  const box = document.getElementById('logsBox');
-  box.innerHTML = logs.map(l => \`<div class="log-line"><span>\${new Date(l.time).toLocaleString('fa-IR')}</span> — \${l.message}</div>\`).join('') || '<div class="log-line">لاگی ثبت نشده</div>';
-}
-
-async function changePassword() {
-  const newPass = prompt('رمز عبور جدید را وارد کنید (حداقل ۶ کاراکتر):');
-  if (!newPass) return;
-  await api('/admin/password', { method: 'POST', body: JSON.stringify({ password: newPass }) });
-  showToast('رمز عبور تغییر کرد — دوباره وارد شوید');
-  localStorage.removeItem('vp_token');
-  setTimeout(() => location.reload(), 1200);
-}
-
-if (ADMIN_TOKEN) showMain(); else showLogin();
+loadAll();
+setInterval(loadAll, 15000);
 </script>
-</body>
-</html>`;
+</body></html>`;
 }
 
-// -----------------------------------------------------------------------------
-// Main router
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------
+// روتر اصلی درخواست‌های HTTP
+// ---------------------------------------------------------------
+
+async function handleAdminAPI(request, env, url) {
+	const path = url.pathname;
+
+	if (path === '/admin/api/login' && request.method === 'POST') {
+		const { pass } = await request.json();
+		if (pass !== env.ADMIN_PASS) return new Response('Unauthorized', { status: 401 });
+		const token = await makeSessionToken(env);
+		return new Response('OK', {
+			headers: { 'Set-Cookie': `nova_session=${token}; HttpOnly; Path=/; Max-Age=43200; SameSite=Lax` }
+		});
+	}
+
+	// همه‌ی روت‌های زیر نیاز به احراز هویت دارند
+	if (!(await isAuthed(request, env))) return new Response('Unauthorized', { status: 401 });
+
+	if (path === '/admin/api/config' && request.method === 'GET') {
+		return Response.json(await getConfig(env));
+	}
+	if (path === '/admin/api/config' && request.method === 'POST') {
+		const body = await request.json();
+		const cfg = await getConfig(env);
+		Object.assign(cfg, body);
+		await saveConfig(env, cfg);
+		await addLog(env, 'config', 'تنظیمات به‌روزرسانی شد');
+		return Response.json({ ok: true });
+	}
+	if (path === '/admin/api/killswitch' && request.method === 'POST') {
+		const cfg = await getConfig(env);
+		cfg.killSwitch = !cfg.killSwitch;
+		await saveConfig(env, cfg);
+		await addLog(env, 'killswitch', cfg.killSwitch ? 'Kill Switch فعال شد' : 'Kill Switch غیرفعال شد');
+		return Response.json({ ok: true, killSwitch: cfg.killSwitch });
+	}
+	if (path === '/admin/api/healthcheck' && request.method === 'POST') {
+		await runHealthCheckAndFailover(env);
+		return Response.json({ ok: true });
+	}
+	if (path === '/admin/api/apply-host' && request.method === 'POST') {
+		const { host, latency } = await request.json();
+		const cfg = await getConfig(env);
+		const old = cfg.host;
+		cfg.host = host;
+		await saveConfig(env, cfg);
+		await addLog(env, 'auto-update', `HOST دستی از پنل تغییر کرد: ${old || '(خالی)'} -> ${host} (پینگ اندازه‌گیری‌شده در مرورگر: ${latency}ms)`);
+		return Response.json({ ok: true });
+	}
+	if (path === '/admin/api/logs' && request.method === 'GET') {
+		return Response.json(await getLogs(env));
+	}
+	if (path === '/admin/api/users' && request.method === 'GET') {
+		return Response.json(await listUsers(env));
+	}
+	if (path === '/admin/api/users' && request.method === 'POST') {
+		const body = await request.json();
+		const user = {
+			token: uuidv4().replace(/-/g, ''),
+			uuid: uuidv4(),
+			name: body.name || '',
+			active: true,
+			trafficLimitTotal: body.trafficLimitTotal || 0,
+			trafficLimitDaily: body.trafficLimitDaily || 0,
+			trafficUsedTotal: 0,
+			trafficUsedDaily: 0,
+			dailyDate: new Date().toISOString().slice(0, 10),
+			expiresAt: body.expireDays > 0 ? Date.now() + body.expireDays * 86400000 : 0,
+			createdAt: Date.now(),
+		};
+		await saveUser(env, user);
+		await addLog(env, 'user', `کاربر جدید ایجاد شد: ${user.name || user.token}`);
+		return Response.json(user);
+	}
+	const toggleMatch = path.match(/^\/admin\/api\/users\/([^/]+)\/toggle$/);
+	if (toggleMatch && request.method === 'POST') {
+		const user = await getUser(env, toggleMatch[1]);
+		if (!user) return new Response('Not found', { status: 404 });
+		user.active = !user.active;
+		await saveUser(env, user);
+		await addLog(env, 'user', `وضعیت کاربر ${user.name || user.token} تغییر کرد: ${user.active ? 'فعال' : 'غیرفعال'}`);
+		return Response.json({ ok: true });
+	}
+	const deleteMatch = path.match(/^\/admin\/api\/users\/([^/]+)$/);
+	if (deleteMatch && request.method === 'DELETE') {
+		await deleteUser(env, deleteMatch[1]);
+		await addLog(env, 'user', `کاربر ${deleteMatch[1]} حذف شد`);
+		return Response.json({ ok: true });
+	}
+
+	return new Response('Not found', { status: 404 });
+}
+
+async function handleSubscription(request, env, url) {
+	const token = url.searchParams.get('token');
+	if (!token) return new Response('token لازم است', { status: 400 });
+	const user = await getUser(env, token);
+	if (!user) return new Response('کاربر یافت نشد', { status: 404 });
+	if (!isUserValid(user)) return new Response('اشتراک منقضی یا غیرفعال است', { status: 403 });
+
+	const cfg = await getConfig(env);
+	if (!cfg.host) return new Response('HOST هنوز تنظیم نشده؛ از پنل ادمین یک آی‌پی اعمال کنید', { status: 503 });
+
+	const format = url.searchParams.get('format') || 'base64';
+	if (format === 'clash' || format === 'yaml') {
+		return new Response(buildClashYAML(cfg, user), { headers: { 'content-type': 'text/yaml; charset=utf-8' } });
+	}
+	return new Response(buildSubscriptionBase64(cfg, user), {
+		headers: {
+			'content-type': 'text/plain; charset=utf-8',
+			// این هدرها به کلاینت اجازه می‌دهند اطلاعات ترافیک/انقضا را هم نمایش دهد
+			'subscription-userinfo': `upload=0; download=${user.trafficUsedTotal || 0}; total=${user.trafficLimitTotal || 0}; expire=${user.expiresAt ? Math.floor(user.expiresAt / 1000) : 0}`,
+		}
+	});
+}
 
 export default {
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-    const { pathname } = url;
-    const method = request.method;
+	async fetch(request, env, ctx) {
+		const url = new URL(request.url);
 
-    if (method === 'OPTIONS') {
-      return new Response(null, {
-        status: 204,
-        headers: {
-          'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS',
-          'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-        },
-      });
-    }
+		// ---- اگر Kill Switch فعال است، همه اتصالات پروکسی رد می‌شوند ----
+		const upgradeHeader = request.headers.get('Upgrade');
 
-    try {
-      if (pathname === '/admin' && method === 'GET') {
-        return htmlResponse(renderAdminPanel());
-      }
+		try {
+			// صفحه ورود و پنل ادمین
+			if (url.pathname === '/admin') {
+				if (!(await isAuthed(request, env))) return new Response(loginPageHTML(), { headers: { 'content-type': 'text/html; charset=utf-8' } });
+				return new Response(adminPageHTML(), { headers: { 'content-type': 'text/html; charset=utf-8' } });
+			}
+			if (url.pathname.startsWith('/admin/api/')) {
+				return await handleAdminAPI(request, env, url);
+			}
 
-      if (pathname === '/admin/login' && method === 'POST') {
-        const { allowed, state } = await checkLoginRateLimit(env);
-        if (!allowed) {
-          return jsonResponse({ error: 'تلاش‌های ناموفق زیاد — چند دقیقه صبر کنید' }, 429);
-        }
-        const { password } = await request.json().catch(() => ({}));
-        const valid = typeof password === 'string' && (await verifyAdminPass(env, password));
-        await recordLoginAttempt(env, state, valid);
-        if (!valid) {
-          await appendLog(env, 'Failed admin login attempt');
-          return jsonResponse({ error: 'رمز عبور اشتباه است' }, 401);
-        }
-        const token = uuid() + uuid();
-        await setAdminSession(env, token);
-        await appendLog(env, 'Admin logged in');
-        return jsonResponse({ token });
-      }
+			// لینک اشتراک
+			if (url.pathname === '/sub') {
+				return await handleSubscription(request, env, url);
+			}
 
-      if (pathname.startsWith('/admin/')) {
-        const authed = await requireAdmin(request, env);
-        if (!authed) return jsonResponse({ error: 'Unauthorized' }, 401);
-      }
+			// اتصال VLESS واقعی روی WebSocket
+			if (upgradeHeader === 'websocket') {
+				const cfg = await getConfig(env);
+				if (cfg.killSwitch) return new Response('سرویس موقتاً غیرفعال است (Kill Switch)', { status: 503 });
 
-      if (pathname === '/admin/settings' && method === 'GET') return jsonResponse(await getSettings(env));
+				// شناسایی کاربر از روی UUID موجود در مسیر یا هدر (اینجا از query استفاده می‌کنیم)
+				const token = url.searchParams.get('token');
+				const user = token ? await getUser(env, token) : null;
+				if (!user || !isUserValid(user)) {
+					return new Response('دسترسی غیرمجاز', { status: 403 });
+				}
+				return await handleVlessWebSocket(request, env, user);
+			}
 
-      if (pathname === '/admin/settings' && method === 'POST') {
-        const body = await request.json().catch(() => ({}));
-        const saved = await saveSettings(env, body);
-        await appendLog(env, `Settings updated${saved.killSwitch ? ' (KILL SWITCH ENABLED)' : ''}`);
-        return jsonResponse(saved);
-      }
+			return new Response('Nova Proxy Worker فعال است.', { status: 200 });
+		} catch (err) {
+			await addLog(env, 'error', String(err && err.stack ? err.stack : err));
+			return new Response('خطای داخلی: ' + String(err), { status: 500 });
+		}
+	},
 
-      if (pathname === '/admin/logs' && method === 'GET') return jsonResponse(await getLogs(env));
-
-      if (pathname === '/admin/users' && method === 'GET') return jsonResponse(await getUsers(env));
-
-      if (pathname === '/admin/user' && method === 'POST') {
-        const body = await request.json().catch(() => ({}));
-        if (!body.name || typeof body.name !== 'string') return jsonResponse({ error: 'name is required' }, 400);
-        const users = await getUsers(env);
-        const newUser = {
-          id: uuid(),
-          name: body.name.trim(),
-          username: (body.username || '').trim(),
-          token: uuid(),
-          uuid: uuid(),
-          enabled: true,
-          expiry: body.expiry || null,
-          quotaBytes: Number.isFinite(body.quotaBytes) ? Math.max(0, Math.round(body.quotaBytes)) : 0,
-          dailyQuotaBytes: Number.isFinite(body.dailyQuotaBytes) ? Math.max(0, Math.round(body.dailyQuotaBytes)) : 0,
-          usedBytes: 0,
-          dailyUsedBytes: 0,
-          dailyResetAt: dailyWindowStart(Date.now()),
-          createdAt: new Date().toISOString(),
-        };
-        users.push(newUser);
-        await saveUsers(env, users);
-        await appendLog(env, `User created: ${newUser.name}`);
-        return jsonResponse(newUser, 201);
-      }
-
-      if (pathname.startsWith('/admin/user/') && method === 'PUT') {
-        const id = pathname.split('/').pop();
-        const body = await request.json().catch(() => ({}));
-        const users = await getUsers(env);
-        const idx = users.findIndex((u) => u.id === id);
-        if (idx === -1) return jsonResponse({ error: 'User not found' }, 404);
-        const allowedFields = ['name', 'username', 'enabled', 'expiry', 'quotaBytes', 'dailyQuotaBytes', 'usedBytes', 'dailyUsedBytes'];
-        for (const field of allowedFields) if (body[field] !== undefined) users[idx][field] = body[field];
-        await saveUsers(env, users);
-        await appendLog(env, `User updated: ${users[idx].name}`);
-        return jsonResponse(users[idx]);
-      }
-
-      if (pathname.startsWith('/admin/user/') && method === 'DELETE') {
-        const id = pathname.split('/').pop();
-        const users = await getUsers(env);
-        const filtered = users.filter((u) => u.id !== id);
-        if (filtered.length === users.length) return jsonResponse({ error: 'User not found' }, 404);
-        await saveUsers(env, filtered);
-        await appendLog(env, `User deleted: ${id}`);
-        return jsonResponse({ success: true });
-      }
-
-      if (pathname === '/admin/password' && method === 'POST') {
-        const { password } = await request.json().catch(() => ({}));
-        if (!password || typeof password !== 'string' || password.length < 6) {
-          return jsonResponse({ error: 'Password must be at least 6 characters' }, 400);
-        }
-        await setAdminPass(env, password);
-        await clearAdminSession(env);
-        await appendLog(env, 'Admin password changed');
-        return jsonResponse({ success: true });
-      }
-
-      if (pathname === '/radar/cache' && method === 'GET') {
-        const cache = await getRadarCache(env);
-        return jsonResponse(cache || { scannedAt: null, results: [] });
-      }
-
-      if (pathname === '/radar/scan' && method === 'POST') {
-        const body = await request.json().catch(() => ({}));
-        const poolSize = Math.min(Math.max(Number(body.poolSize) || 60, 10), 300);
-        const results = await runRadarScan(body.ips, poolSize);
-        const cache = await saveRadarCache(env, results);
-        await appendLog(env, `Radar scan: ${results.length}/${poolSize} IPs responded`);
-        return jsonResponse(cache);
-      }
-
-      if (pathname === '/radar/apply' && method === 'POST') {
-        const { host } = await request.json().catch(() => ({}));
-        if (!host || typeof host !== 'string') return jsonResponse({ error: 'host is required' }, 400);
-        const settings = await getSettings(env);
-        settings.host = host.trim();
-        const saved = await saveSettings(env, settings);
-        await appendLog(env, `Radar applied host: ${host}`);
-        return jsonResponse(saved);
-      }
-
-      if (pathname === '/sub' && method === 'GET') {
-        const token = url.searchParams.get('token');
-        if (!token) return textResponse('Missing token', 400);
-        const users = await getUsers(env);
-        const user = findUserByToken(users, token);
-        const settings = await getSettings(env);
-        const check = userIsUsable(user, settings);
-        if (!check.ok) return textResponse(check.reason, 403);
-        return textResponse(base64Encode(buildVlessUri(user, settings)));
-      }
-
-      if (pathname === '/sub/mihomo.yaml' && method === 'GET') {
-        const token = url.searchParams.get('token');
-        if (!token) return textResponse('Missing token', 400);
-        const users = await getUsers(env);
-        const user = findUserByToken(users, token);
-        const settings = await getSettings(env);
-        const check = userIsUsable(user, settings);
-        if (!check.ok) return textResponse(check.reason, 403);
-        return textResponse(buildClashYaml(user, settings), 200, 'text/yaml; charset=utf-8');
-      }
-
-      if (pathname === '/ws' || pathname.startsWith('/ws')) {
-        const token = url.searchParams.get('token');
-        if (!token) return textResponse('Missing token', 400);
-        const upgradeHeader = request.headers.get('Upgrade');
-        if (!upgradeHeader || upgradeHeader.toLowerCase() !== 'websocket') {
-          return textResponse('Expected WebSocket upgrade', 426);
-        }
-        const users = await getUsers(env);
-        const user = findUserByToken(users, token);
-        const settings = await getSettings(env);
-        const check = userIsUsable(user, settings);
-        if (!check.ok) return textResponse(check.reason, 403);
-        return handleVlessWebSocket(request, env, user);
-      }
-
-      if (pathname === '/' || pathname === '') return textResponse(`${BRAND} is running.`);
-
-      return textResponse('Not found', 404);
-    } catch (err) {
-      await appendLog(env, `Unhandled error: ${err.message}`);
-      return jsonResponse({ error: 'Internal server error' }, 500);
-    }
-  },
+	// ---- Cron Trigger: اسکن/Health-Check دوره‌ای و به‌روزرسانی خودکار HOST ----
+	async scheduled(event, env, ctx) {
+		ctx.waitUntil(runHealthCheckAndFailover(env));
+	},
 };
