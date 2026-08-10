@@ -1,7 +1,0 @@
-name = "zephyr-proxy"
-main = "zephyr-worker.js"
-compatibility_date = "2024-09-23"
-
-[[kv_namespaces]]
-binding = "ZEPHYR_KV"
-id = "cb95ff5a47564024a676f56c0cddaf48"
