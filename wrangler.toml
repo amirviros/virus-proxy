@@ -4,4 +4,4 @@ compatibility_date = "2024-09-23"
 
 [[kv_namespaces]]
 binding = "ZEPHYR_KV"
-id = "PUT_YOUR_KV_NAMESPACE_ID_HERE"
+id = "cb95ff5a47564024a676f56c0cddaf48"
