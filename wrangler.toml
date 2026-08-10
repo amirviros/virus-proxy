@@ -1,17 +1,10 @@
-name = "virus-proxy"
+name = "empty-darkness-f977"
 main = "worker.js"
-compatibility_date = "2024-01-01"
-compatibility_flags = ["nodejs_compat"]
+compatibility_date = "2024-08-10"
 
-# Cloudflare KV namespace used for all persistent data (settings, users, sessions, logs).
-# Create it first with:  npx wrangler kv namespace create VIRUS_PROXY_KV
-# then paste the returned id below.
 kv_namespaces = [
-  { binding = "VIRUS_PROXY_KV", id = "YOUR_KV_ID" }
+  { binding = "VIRUS_PROXY_KV", id = "fd12429938dc4fe2bf4b35448052e21e" }
 ]
 
-# Optional: sets the initial admin password on first run (before any password
-# has been saved to KV). After the first login you should change it from the
-# admin panel — from then on the KV-stored password takes precedence.
 [vars]
-ADMIN_PASS = "change-this-password"
+ADMIN_PASS = "3861679353"
