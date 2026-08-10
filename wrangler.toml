@@ -1,10 +1,15 @@
-name = "empty-darkness-f977"
+# ================================================================
+#  پیکربندی Wrangler برای Amir Nova Proxy
+# ================================================================
+
+name = "amir-nova-proxy"
 main = "worker.js"
-compatibility_date = "2024-08-10"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
 
-kv_namespaces = [
-  { binding = "VIRUS_PROXY_KV", id = "fd12429938dc4fe2bf4b35448052e21e" }
-]
+[[kv_namespaces]]
+binding = "NOVA_KV"
+id = "fd12429938dc4fe2bf4b35448052e21e"
 
-[vars]
-ADMIN_PASS = "3861679353"
+[triggers]
+crons = ["0 */6 * * *"]
