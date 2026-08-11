@@ -8,7 +8,7 @@
     { "binding": "DB" }
   ],
   "kv_namespaces": [
-    { "binding": "KV" }
+    { "binding": "11b68f79726c4ffca3be31f5144bc721" }
   ],
   "workers_dev": true,
   "preview_urls": true,
