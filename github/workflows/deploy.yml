@@ -1,0 +1,43 @@
+name: 🚀 Deploy Nova Worker (One-Click)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: ⚙️ Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 📦 Install Wrangler
+        run: npm install -g wrangler
+
+      - name: 📄 Create wrangler.toml with your KV ID
+        run: |
+          cat > wrangler.toml << 'EOF'
+          name = "nova-worker"
+          main = "worker.js"
+          compatibility_date = "2024-01-01"
+
+          [[kv_namespaces]]
+          binding = "KV"
+          id = "11b68f79726c4ffca3be31f5144bc721"
+          EOF
+
+      - name: 🚀 Deploy to Cloudflare Workers
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+        run: |
+          wrangler deploy \
+            --name nova-worker \
+            --compatibility-date 2024-01-01
