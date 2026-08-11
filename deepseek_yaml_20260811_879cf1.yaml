@@ -1,0 +1,83 @@
+name: Sync Worker from Cloudflare (Using KV)
+
+on:
+  push:
+    branches: [ main ]      # با هر بار پوش روی شاخه main اجرا می‌شه
+  workflow_dispatch:        # یا با کلیک دکمه‌ی "Run workflow" دستی
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Fetch configs from Cloudflare KV & Download Worker
+        id: fetch
+        env:
+          # این ۳ تا رو توی Secrets گیت‌هاب ست کن (تنها چیزی که نیاز داری)
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_WORKER_NAME: ${{ secrets.CF_WORKER_NAME }}
+          
+          # شناسه‌ی همون KV که گفتی (همینجا نوشته شده، نیازی به Secret نیست)
+          KV_NS_ID: "11b68f79726c4ffca3be31f5144bc721"
+        run: |
+          echo "📥 دریافت توکن گیت‌هاب و تنظیمات از Cloudflare KV..."
+          
+          # ۱. دریافت توکن گیت‌هاب از KV (کلید: github_token)
+          GH_TOKEN=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${KV_NS_ID}/values/github_token" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}")
+          
+          # ۲. دریافت نام مخزن از KV (کلید: github_repo) 
+          GH_REPO=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${KV_NS_ID}/values/github_repo" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}")
+          
+          # ۳. دریافت شاخه از KV (کلید: github_branch) - اختیاری، پیش‌فرض main
+          GH_BRANCH=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${KV_NS_ID}/values/github_branch" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}")
+          GH_BRANCH=${GH_BRANCH:-main}
+          
+          # ۴. دریافت مسیر فایل از KV (کلید: github_path) - اختیاری، پیش‌فرض worker.js
+          GH_PATH=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${KV_NS_ID}/values/github_path" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}")
+          GH_PATH=${GH_PATH:-worker.js}
+
+          # ذخیره در متغیرهای محیطی برای مرحله بعد
+          echo "GH_TOKEN=$GH_TOKEN" >> $GITHUB_ENV
+          echo "GH_REPO=$GH_REPO" >> $GITHUB_ENV
+          echo "GH_BRANCH=$GH_BRANCH" >> $GITHUB_ENV
+          echo "GH_PATH=$GH_PATH" >> $GITHUB_ENV
+
+          echo "✅ تنظیمات دریافت شد. مخزن: ${GH_REPO}, مسیر: ${GH_PATH}"
+
+          # ۵. دانلود کد ورکر از کلودفلر
+          echo "📥 دانلود کد ورکر از Cloudflare..."
+          curl -L -X GET "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/workers/scripts/${CF_WORKER_NAME}/content" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            -o worker.js
+          
+          echo "✅ کد ورکر دانلود شد."
+
+      - name: Commit & Push to GitHub
+        env:
+          GH_TOKEN: ${{ env.GH_TOKEN }}
+          GH_REPO: ${{ env.GH_REPO }}
+          GH_BRANCH: ${{ env.GH_BRANCH }}
+          GH_PATH: ${{ env.GH_PATH }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # اضافه کردن فایل (همون worker.js که دانلود شد)
+          git add worker.js
+          
+          # بررسی تغییرات
+          if git diff --staged --quiet; then
+            echo "✅ هیچ تغییری در کد ورکر پیدا نشد. نیازی به کامیت نیست."
+          else
+            echo "📤 ارسال تغییرات به گیت‌هاب..."
+            git commit -m "🔄 همگام‌سازی خودکار worker.js از Cloudflare - $(date -u +'%Y-%m-%d %H:%M:%S')"
+            git push https://x-access-token:${GH_TOKEN}@github.com/${GH_REPO}.git HEAD:${GH_BRANCH}
+            echo "✅ کد با موفقیت به مخزن ارسال شد."
+          fi
