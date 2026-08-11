@@ -1,0 +1,62 @@
+name: 🚀 Auto Deploy Nova
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Get code
+        uses: actions/checkout@v4
+
+      - name: ⚙️ Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 📦 Install Wrangler
+        run: npm install -g wrangler
+
+      - name: 🔍 Find KV Namespace ID
+        id: find_kv
+        env:
+          CLOUDFLARE_API_TOKEN: "cfut_fexOFcQiQ5l5zWg4LIn0Nx7auqivz3mcmpqLlrencfafe802"
+          CLOUDFLARE_ACCOUNT_ID: "${{ secrets.CF_ACCOUNT_ID }}"
+        run: |
+          RESPONSE=$(curl -s -X GET \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/storage/kv/namespaces" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            -H "Content-Type: application/json")
+          
+          KV_ID=$(echo "$RESPONSE" | jq -r '.result[] | select(.title | test("nova|NOVA|kv|KV"; "i")) | .id' | head -1)
+          if [ -z "$KV_ID" ] || [ "$KV_ID" = "null" ]; then
+            KV_ID=$(echo "$RESPONSE" | jq -r '.result[0].id')
+          fi
+          
+          echo "KV_ID=$KV_ID" >> $GITHUB_OUTPUT
+          echo "✅ Found KV: $KV_ID"
+
+      - name: 📄 Create wrangler.toml
+        run: |
+          cat > wrangler.toml << 'EOF'
+          name = "nova-worker"
+          main = "worker.js"
+          compatibility_date = "2024-01-01"
+          
+          [[kv_namespaces]]
+          binding = "KV"
+          id = "${{ steps.find_kv.outputs.KV_ID }}"
+          EOF
+
+      - name: 🚀 Deploy to Cloudflare Workers
+        env:
+          CLOUDFLARE_API_TOKEN: "cfut_fexOFcQiQ5l5zWg4LIn0Nx7auqivz3mcmpqLlrencfafe802"
+          CLOUDFLARE_ACCOUNT_ID: "b7642170e58be44f208a14b3154a1671"
+        run: |
+          wrangler deploy \
+            --name nova-worker \
+            --compatibility-date 2024-01-01
