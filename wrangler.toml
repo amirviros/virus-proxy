@@ -9,8 +9,5 @@ binding = "VIRUS_PROXY_KV"
 id = "11b68f79726c4ffca3be31f5144bc721"
 preview_id = "11b68f79726c4ffca3be31f5144bc721"
 
-[vars]
-# متغیرهای محیطی (اختیاری)
-# ADMIN = "your-password"
-# KEY = "your-key"
-# UUID = "your-uuid"
+# مسیر دقیق فایل اصلی رو مشخص کن
+# اگه توی ریشه هست، همون worker.js کافیه
