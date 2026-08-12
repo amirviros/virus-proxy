@@ -1,4 +1,4 @@
-name = "httpsrestless-firefly-b48camyrmhmdkrmyfrd997workersdevad"
+name = "blue-firefly-fa95"
 main = "worker.js"
 compatibility_date = "2024-12-18"
 compatibility_flags = ["nodejs_compat"]
@@ -9,5 +9,5 @@ id = "11b68f79726c4ffca3be31f5144bc721"
 
 [[d1_databases]]
 binding = "DB"
-database_name = "نوا-دی‌بی"
+database_name = "nova-db"
 database_id = "14e78930-38a4-4843-bb2c-db98b74226ea"
