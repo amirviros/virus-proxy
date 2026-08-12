@@ -1,16 +1,13 @@
-# wrangler.toml
 name = "polished-firefly-1d33"
 main = "worker.js"
 compatibility_date = "2024-12-18"
 compatibility_flags = ["nodejs_compat"]
 
 [[kv_namespaces]]
-binding = "VIRUS_PROXY_KV"
+binding = "KV"
 id = "11b68f79726c4ffca3be31f5144bc721"
-preview_id = "11b68f79726c4ffca3be31f5144bc721"
 
-[vars]
-# متغیرهای محیطی
-ADMIN = "your-password"
-KEY = "your-key"
-UUID = "your-uuid"
+[[d1_databases]]
+binding = "DB"
+database_name = "نوا-دی‌بی"
+database_id = "14e78930-38a4-4843-bb2c-db98b74226ea"   # این رو از D1 که ساختی کپی کن
