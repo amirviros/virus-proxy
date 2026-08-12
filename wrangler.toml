@@ -4,10 +4,29 @@ main = "worker.js"
 compatibility_date = "2024-12-18"
 compatibility_flags = ["nodejs_compat"]
 
+# تنظیمات KV Namespace
 [[kv_namespaces]]
 binding = "VIRUS_PROXY_KV"
 id = "11b68f79726c4ffca3be31f5144bc721"
 preview_id = "11b68f79726c4ffca3be31f5144bc721"
 
-# مسیر دقیق فایل اصلی رو مشخص کن
-# اگه توی ریشه هست، همون worker.js کافیه
+# تنظیمات D1 Database (اختیاری - اگه داری)
+# [[d1_databases]]
+# binding = "DB"
+# database_name = "virus-db"
+# database_id = "your-d1-database-id"
+# preview_database_id = "your-d1-database-id"
+
+# متغیرهای محیطی
+[vars]
+# ADMIN = "your-password"
+# KEY = "your-key"
+# UUID = "your-uuid"
+# HOST = "your-domain.com"
+# PROXYIP = "your-proxy-ip"
+# POOL_API = "https://raw.githubusercontent.com/IRNova/Tools/main/clean-ip"
+# ENABLE_CRON = "1"
+
+# تنظیمات استقرار
+[env.production]
+vars = { ADMIN = "your-password" }
