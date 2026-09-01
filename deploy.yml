@@ -11,6 +11,6 @@ jobs:
       - uses: actions/checkout@v4
       - uses: cloudflare/wrangler-action@v3
         with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          apiToken: cfut_uahUPMHSYXQp3EKpoQcmieydMgr0C69udF6r81IH8bb59451
+          accountId: 7dedff92c0ba532f41ef1e1ce0322833
           command: deploy worker.js --name steep-firefly-eed5
